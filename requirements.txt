@@ -1,0 +1,10 @@
+numpy
+pandas
+scikit-learn
+networkx
+node2vec
+joblib
+qiskit
+qiskit-machine-learning
+matplotlib
+scipy
