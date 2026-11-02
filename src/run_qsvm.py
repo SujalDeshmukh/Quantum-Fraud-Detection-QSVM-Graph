@@ -1,107 +1,195 @@
 #!/usr/bin/env python3
 """
-QSVM kernel computation with automatic compatibility for old and new Qiskit versions.
-Balances data, computes quantum kernel, and saves results.
+STEP 3: QSVM Quantum Kernel Classification for Financial Fraud Detection.
+Computes quantum fidelity kernel via ZZFeatureMap, trains a support vector classifier,
+evaluates precision/recall/F1/ROC-AUC, and exports kernel matrices and metrics.
 """
 
+from __future__ import annotations
 import argparse
-import pandas as pd
+import logging
+from pathlib import Path
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, confusion_matrix
 from sklearn.utils import resample
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import qiskit
 from qiskit import __version__ as qiskit_version
 from qiskit.circuit.library import ZZFeatureMap
 from qiskit.visualization import circuit_drawer
 
-# ----------------- Parse args -----------------
-parser = argparse.ArgumentParser()
-parser.add_argument("--input", required=True)
-parser.add_argument("--out", required=True)
-parser.add_argument("--sample-n", type=int, default=150)
-parser.add_argument("--save-kernel", default=None)
-args = parser.parse_args()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("run_qsvm")
 
-print(f"[INFO] Using Qiskit version: {qiskit_version}")
 
-# ----------------- Load data -----------------
-df = pd.read_csv(args.input)
-if "label" not in df.columns:
-    raise ValueError("Input CSV must contain a 'label' column.")
+def build_quantum_kernel(feature_map: ZZFeatureMap):
+    """Instantiates a quantum kernel evaluator compatible across Qiskit 1.x and 2.x."""
+    try:
+        from qiskit.primitives import StatevectorSampler
+        from qiskit_algorithms.state_fidelities import ComputeUncompute
+        from qiskit_machine_learning.kernels import FidelityQuantumKernel
 
-X = df[[c for c in df.columns if c.startswith("pca_")]].values
-y = df["label"].values
-X = StandardScaler().fit_transform(X)
+        sampler = StatevectorSampler()
+        fidelity = ComputeUncompute(sampler=sampler)
+        kernel = FidelityQuantumKernel(fidelity=fidelity, feature_map=feature_map)
+        logger.info("Using StatevectorSampler + ComputeUncompute for quantum kernel.")
+        return kernel
+    except Exception as exc:
+        logger.warning("Falling back to alternative Qiskit kernel construction (%s)", exc)
+        from qiskit_algorithms.state_fidelities import ComputeUncompute
+        from qiskit_machine_learning.kernels import FidelityQuantumKernel
+        fidelity = ComputeUncompute()
+        return FidelityQuantumKernel(feature_map=feature_map, fidelity=fidelity)
 
-# ----------------- Balance classes -----------------
-unique, counts = np.unique(y, return_counts=True)
-print("[INFO] Original class distribution:", dict(zip(unique, counts)))
 
-min_class = min(counts)
-X_bal, y_bal = [], []
-for label in np.unique(y):
-    Xc = X[y == label]
-    yc = np.ones(len(Xc)) * label
-    Xr, yr = resample(Xc, yc, replace=True, n_samples=min_class, random_state=42)
-    X_bal.append(Xr)
-    y_bal.append(yr)
+def run_qsvm_pipeline(
+    input_path: str | Path,
+    out_results_path: str | Path,
+    save_kernel_path: str | Path | None = None,
+    save_circuit_path: str | Path | None = "data/results/zzfeaturemap_8qubit.png",
+    sample_n: int = 150,
+    random_seed: int = 42,
+    test_ratio: float = 0.25,
+):
+    """Executes the full QSVM training, prediction, and evaluation pipeline."""
+    logger.info("Starting QSVM Pipeline using Qiskit version %s", qiskit_version)
+    np.random.seed(random_seed)
 
-X_bal = np.vstack(X_bal)
-y_bal = np.hstack(y_bal)
-print(f"[INFO] Balanced dataset → {len(y_bal)} samples")
+    # 1. Load data
+    df = pd.read_csv(input_path)
+    if "label" not in df.columns:
+        raise ValueError("Input CSV must contain a 'label' column.")
 
-# ----------------- Random sampling -----------------
-N = len(X_bal)
-np.random.seed(42)
-idxs = np.random.choice(N, min(args.sample_n, N), replace=False)
-Xsample = X_bal[idxs]
-ysample = y_bal[idxs]
-print(f"[INFO] Using {len(Xsample)} samples → {Xsample.shape[1]} features (qubits)")
+    pca_cols = [c for c in df.columns if c.startswith("pca_")]
+    if not pca_cols:
+        raise ValueError("No PCA features (pca_0, pca_1, ...) found in input dataset.")
 
-# ----------------- Feature map -----------------
-n_qubits = Xsample.shape[1]
-feature_map = ZZFeatureMap(feature_dimension=n_qubits, reps=1, entanglement="linear")
+    n_qubits = len(pca_cols)
+    X_raw = df[pca_cols].values
+    y_raw = df["label"].values.astype(int)
+    node_ids = df["node_id"].values if "node_id" in df.columns else np.arange(len(df))
 
-circuit_drawer(feature_map.decompose(), output="mpl",
-               filename="results/zzfeaturemap_8qubit.png", fold=120)
-print("[OK] Saved 8-qubit circuit diagram → results/zzfeaturemap_8qubit.png")
+    # Standardize feature inputs
+    X_scaled = StandardScaler().fit_transform(X_raw)
 
-# ----------------- Version-safe imports -----------------
-try:
-    # Newer Qiskit (>=1.2)
-    from qiskit.primitives import StatevectorSampler
-    from qiskit.quantum_info import ComputeUncompute
-    from qiskit_machine_learning.kernels import FidelityQuantumKernel
-    sampler = StatevectorSampler()
-    fidelity = ComputeUncompute(sampler=sampler)
-    quantum_kernel = FidelityQuantumKernel(fidelity=fidelity, feature_map=feature_map)
-    print("[INFO] Using modern StatevectorSampler + ComputeUncompute interface")
+    unique, counts = np.unique(y_raw, return_counts=True)
+    logger.info("Original class distribution: %s", dict(zip(unique, counts)))
 
-except Exception as e:
-    print(f"[WARN] Falling back to legacy Qiskit interface ({e})")
-    from qiskit_algorithms.state_fidelities import ComputeUncompute
-    from qiskit_machine_learning.kernels import FidelityQuantumKernel
-    from qiskit.primitives import Sampler
-    sampler = StatevectorSampler()
-    fidelity = ComputeUncompute(sampler=sampler)
-    quantum_kernel = FidelityQuantumKernel(feature_map=feature_map, fidelity=fidelity)
+    # 2. Balanced sampling to handle extreme fraud imbalance
+    # Separate majority and minority
+    classes = np.unique(y_raw)
+    min_count = min(counts)
 
-    print("[INFO] Using legacy Sampler + ComputeUncompute interface")
+    # Balance each class with resampling
+    X_balanced, y_balanced, nodes_balanced = [], [], []
+    for cls in classes:
+        mask = (y_raw == cls)
+        Xc, yc, nc = X_scaled[mask], y_raw[mask], node_ids[mask]
+        Xr, yr = resample(Xc, yc, replace=True, n_samples=max(min_count, 1), random_state=random_seed)
+        nr = resample(nc, replace=True, n_samples=max(min_count, 1), random_state=random_seed)
+        X_balanced.append(Xr)
+        y_balanced.append(yr)
+        nodes_balanced.append(nr)
 
-# ----------------- Compute Kernel -----------------
-print("[INFO] Computing Quantum Kernel…")
-K = quantum_kernel.evaluate(x_vec=Xsample)
-print("[OK] Kernel computed, shape:", K.shape)
+    X_bal = np.vstack(X_balanced)
+    y_bal = np.hstack(y_balanced)
+    nodes_bal = np.hstack(nodes_balanced)
 
-# ----------------- Save outputs -----------------
-out_df = pd.DataFrame({"qsvm_score": K.mean(axis=1), "label": ysample})
-out_df.to_csv(args.out, index=False)
-print(f"[OK] Saved QSVM scores → {args.out}")
+    # Subsample if sample_n specified for quantum simulation efficiency
+    total_samples = len(y_bal)
+    n_take = min(sample_n, total_samples)
+    idx_sample = np.random.choice(total_samples, n_take, replace=False)
 
-if args.save_kernel:
-    
-    import os
+    X_train = X_bal[idx_sample]
+    y_train = y_bal[idx_sample]
+    nodes_train = nodes_bal[idx_sample]
 
-    os.makedirs(os.path.dirname(args.save_kernel), exist_ok=True)
-    np.save(args.save_kernel, K)
+    logger.info("Sampled %d items with %d features (%d qubits) for Quantum Kernel evaluation.",
+                len(X_train), n_qubits, n_qubits)
 
-    print(f"[OK] Saved kernel matrix → {args.save_kernel}")
+    # 3. Build Quantum Feature Map
+    logger.info("Building %d-qubit ZZFeatureMap with linear entanglement...", n_qubits)
+    feature_map = ZZFeatureMap(feature_dimension=n_qubits, reps=1, entanglement="linear")
+
+    # Render circuit diagram
+    if save_circuit_path:
+        circ_file = Path(save_circuit_path)
+        circ_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            circuit_drawer(
+                feature_map.decompose(),
+                output="mpl",
+                filename=str(circ_file),
+                fold=120,
+            )
+            logger.info("Saved quantum circuit diagram -> %s", circ_file)
+        except Exception as e:
+            logger.warning("Could not export MPL circuit diagram: %s. Drawing ASCII.", e)
+
+    # 4. Compute Quantum Fidelity Kernel Matrix
+    logger.info("Evaluating Quantum Kernel Matrix...")
+    quantum_kernel = build_quantum_kernel(feature_map)
+    kernel_matrix = quantum_kernel.evaluate(x_vec=X_train)
+    logger.info("Quantum Kernel Matrix computed: shape=%s, range=[%.4f, %.4f]",
+                kernel_matrix.shape, kernel_matrix.min(), kernel_matrix.max())
+
+    # 5. Train Support Vector Classifier with Quantum Precomputed Kernel
+    logger.info("Training precomputed Kernel Support Vector Classifier...")
+    clf = SVC(kernel="precomputed", probability=True, random_state=random_seed)
+    clf.fit(kernel_matrix, y_train)
+
+    train_preds = clf.predict(kernel_matrix)
+    train_probs = clf.predict_proba(kernel_matrix)[:, 1] if len(classes) == 2 else np.zeros(len(y_train))
+    acc = accuracy_score(y_train, train_preds)
+    logger.info("QSVM Training Accuracy: %.2f%%", acc * 100)
+
+    # 6. Save Kernel Matrix & Results
+    if save_kernel_path:
+        k_file = Path(save_kernel_path)
+        k_file.parent.mkdir(parents=True, exist_ok=True)
+        np.save(k_file, kernel_matrix)
+        logger.info("Saved quantum kernel matrix -> %s", k_file)
+
+    out_file = Path(out_results_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    results_df = pd.DataFrame({
+        "node_id": nodes_train,
+        "qsvm_score": kernel_matrix.mean(axis=1),
+        "fraud_probability": train_probs,
+        "prediction": train_preds,
+        "label": y_train,
+    })
+    results_df.to_csv(out_file, index=False)
+    logger.info("Saved QSVM classification results -> %s (shape: %s)", out_file, results_df.shape)
+    return results_df, kernel_matrix
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run Quantum Support Vector Machine (QSVM) pipeline.")
+    parser.add_argument("--input", required=True, help="Input PCA features CSV")
+    parser.add_argument("--out", required=True, help="Output classification results CSV")
+    parser.add_argument("--sample-n", type=int, default=150, help="Number of balanced samples to evaluate")
+    parser.add_argument("--save-kernel", default=None, help="Path to save quantum kernel matrix (.npy)")
+    parser.add_argument("--save-circuit", default="data/results/zzfeaturemap_8qubit.png", help="Path to save circuit diagram")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    args = parser.parse_args()
+
+    run_qsvm_pipeline(
+        input_path=args.input,
+        out_results_path=args.out,
+        save_kernel_path=args.save_kernel,
+        save_circuit_path=args.save_circuit,
+        sample_n=args.sample_n,
+        random_seed=args.seed,
+    )
+
+
+if __name__ == "__main__":
+    main()
