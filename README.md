@@ -1,9 +1,6 @@
 # Quantum Fraud Detection with Graph Embeddings and QSVM
 
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
-[![Qiskit 2.x](https://img.shields.io/badge/Qiskit-2.x-612999.svg)](https://qiskit.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![CI](https://img.shields.io/badge/Tests-4%20Passed-brightgreen.svg)](#testing)
+
 
 An end-to-end financial transaction fraud detection pipeline combining **Network Graph Feature Engineering** (Degree Centrality, PageRank, Node2Vec Random Walks), **PCA Dimensionality Reduction**, and a **Quantum Support Vector Machine (QSVM)** with parameterized $ZZ$-Feature Maps.
 
